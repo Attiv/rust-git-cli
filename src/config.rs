@@ -351,9 +351,14 @@ auto_stage = false
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
-        // Locate the matching assignment within the right section.
+        // Locate the matching assignment within the right section. A
+        // commented-out assignment counts as a candidate: the generated
+        // template ships every optional key in `# key = ...` form, so ignoring
+        // those would make `set` append a second assignment and the file would
+        // then fail to parse with "duplicate key".
         let mut current: Option<String> = None;
-        let mut target: Option<usize> = None;
+        let mut active: Option<usize> = None;
+        let mut commented: Option<usize> = None;
 
         for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -363,30 +368,68 @@ auto_stage = false
                 continue;
             }
 
-            if trimmed.starts_with('#') {
+            let same_section = match (&current, &section) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_section {
                 continue;
             }
 
-            if let Some((k, _)) = trimmed.split_once('=') {
-                let same_section = match (&current, &section) {
-                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                    (None, None) => true,
-                    _ => false,
-                };
+            let is_comment = trimmed.starts_with('#');
+            let body = if is_comment {
+                trimmed.trim_start_matches('#').trim_start()
+            } else {
+                trimmed
+            };
 
-                if same_section && k.trim() == field {
-                    target = Some(idx);
-                    break;
+            if let Some((k, _)) = body.split_once('=') {
+                if k.trim() == field {
+                    if is_comment {
+                        commented.get_or_insert(idx);
+                    } else {
+                        active = Some(idx);
+                        break;
+                    }
                 }
             }
         }
 
-        match target {
+        match active.or(commented) {
             Some(idx) => {
                 let line = lines[idx].clone();
-                if let Some(eq) = line.find('=') {
-                    lines[idx] = format!("{} = {}", line[..eq].trim_end(), formatted);
-                }
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let trimmed = line.trim();
+                let body = if trimmed.starts_with('#') {
+                    trimmed.trim_start_matches('#').trim_start()
+                } else {
+                    trimmed
+                };
+
+                let (head, trailing_comment) = split_inline_comment(body);
+                let Some(eq) = head.find('=') else {
+                    unreachable!("line was matched on the presence of '='")
+                };
+
+                // Keep whatever separation and comment followed the old value.
+                let gap = &head[head.trim_end().len()..];
+                let gap = if trailing_comment.is_empty() {
+                    ""
+                } else if gap.is_empty() {
+                    "  "
+                } else {
+                    gap
+                };
+
+                lines[idx] = format!(
+                    "{}{} = {}{}{}",
+                    indent,
+                    head[..eq].trim_end(),
+                    formatted,
+                    gap,
+                    trailing_comment
+                );
             }
             None => {
                 let new_line = format!("{} = {}", field, formatted);
@@ -444,6 +487,32 @@ pub fn mask_secret(value: &str) -> String {
     let head: String = chars[..4].iter().collect();
     let tail: String = chars[chars.len() - 4..].iter().collect();
     format!("{}…{}", head, tail)
+}
+
+/// Split a TOML line into `(code, trailing comment)`.
+///
+/// A `#` inside a quoted value is not a comment, so quotes are tracked. The
+/// first part keeps the whitespace that separated it from the comment, which
+/// lets callers preserve the original layout.
+fn split_inline_comment(line: &str) -> (&str, &str) {
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '#' if !in_string => return (&line[..idx], &line[idx..]),
+            _ => {}
+        }
+    }
+
+    (line, "")
 }
 
 /// `[ai]` -> Some("ai"), anything else -> None.
@@ -559,6 +628,64 @@ auto_stage = false
 
         let parsed: Config = toml::from_str(&out).unwrap();
         assert_eq!(parsed.ai.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn set_uncomments_the_placeholder_instead_of_appending_a_duplicate() {
+        // The generated template ships optional keys commented out. Appending a
+        // second `api_key` next to the comment made the file unparseable with
+        // "duplicate key", which is how a working config got broken in practice.
+        let content = r#"[ai]
+provider = "openai"
+model = "gpt-4"
+# api_key = "your-api-key-here"
+"#;
+        let path = temp_config("uncomment", content);
+
+        Config::set_key_value(&path, "ai.api_key", "sk-test").unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert_eq!(out.matches("api_key =").count(), 1, "got:\n{}", out);
+        assert!(out.contains("api_key = \"sk-test\""));
+
+        let parsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.ai.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn set_keeps_a_trailing_comment_on_the_line_it_rewrites() {
+        let content = r#"[ai]
+provider = "openai"
+model = "gpt-4"
+base_url = "http://127.0.0.1:8045/v1"   # For local LLMs
+"#;
+        let path = temp_config("trailing", content);
+
+        Config::set_key_value(&path, "ai.base_url", "http://127.0.0.1:9000/v1").unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("base_url = \"http://127.0.0.1:9000/v1\"   # For local LLMs"),
+            "got:\n{}",
+            out
+        );
+
+        let parsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed.ai.base_url.as_deref(),
+            Some("http://127.0.0.1:9000/v1")
+        );
+    }
+
+    #[test]
+    fn a_hash_inside_a_value_is_not_a_comment() {
+        let (code, comment) = split_inline_comment(r#"model = "a# b"   # real comment"#);
+        assert_eq!(code, r#"model = "a# b"   "#);
+        assert_eq!(comment, "# real comment");
+
+        let (code, comment) = split_inline_comment(r#"model = "a# b""#);
+        assert_eq!(code, r#"model = "a# b""#);
+        assert!(comment.is_empty());
     }
 
     #[test]
