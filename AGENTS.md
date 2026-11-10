@@ -68,15 +68,17 @@ CLI (src/cli.rs) → Main dispatch (src/main.rs) → Command handlers
 
 ### Key Component Behaviors
 
-**`src/main.rs`** — `init` and `config` bypass the git repo check (handled before repo validation). `check_and_stage_changes()` prompts before staging unstaged files. Commands: Status (default), Commit, Review, Diff, Log, Init, Config.
+**`src/main.rs`** — `init` and `config` bypass the git repo check (handled before repo validation). `check_and_stage_changes()` prompts before staging unstaged files. Commands: Status (default), Commit, Review, Diff, Log, Init, Config, Hook.
 
-**`src/ai/mod.rs`** — `AIClient` enum dispatches to OpenAI/Anthropic providers. `CommitMessage` uses custom deserializers for flexible JSON parsing. `build_prompt()` generates the bilingual prompt with diff context; `generate_changelog()` summarizes selected commits.
+**`src/ai/mod.rs`** — `AIClient` enum dispatches to OpenAI/Anthropic providers. `CommitMessage` uses custom deserializers for flexible JSON parsing. `build_prompt()` generates the bilingual prompt with diff context; `generate_changelog()` summarizes selected commits. `CommitMessage::render(format, include_emoji)` is the single rendering entry point: `format_conventional` / `format_plain` / `format_english`, with `FORMATS` as the authoritative list of valid values. Unknown formats fall back to `conventional`; only `config doctor` and `config show` surface the typo, so keep the fallback silent but the diagnosis loud.
 
 **`src/git.rs`** — `GitRepo` wrapper exposing `get_status()`, `get_diff()`, `get_combined_diff()`, `get_branch_info()`, `get_commits()`. Handles unborn branches (new repos without commits).
 
 **`src/config.rs`** — Lookup order: `./.rust-git-cli.toml` → `~/.config/rust-git-cli/config.toml` → `~/.rust-git-cli.toml`. API key priority: CLI arg → config file → env var → interactive prompt. `config set` rewrites one value in place and keeps the surrounding comments; it never re-serializes the whole file. `commit.max_diff_size` caps the diff sent to the provider (review uses twice the value). A parse failure is reported on stderr and falls back to defaults — never silently.
 
-**`src/ui.rs`** — `CommitUI::confirm_commit()` offers Accept/Edit/Regenerate/Cancel. Color-coded diff preview. Clipboard support via `arboard` (used in the `log` command for changelog copy).
+`ai.api_key_env` holds a variable **name**, not the key. That distinction is enforced in three places and must stay that way: `Config::validate_set()` refuses to write a non-name there (and rejects unknown providers/formats), `is_env_var_name()` is the single predicate, and `get_api_key()` warns once on stderr before returning `None` instead of pretending the variable is simply unset. The original bug was a key in that field producing "not set in this shell" with no clue why.
+
+**`src/ui.rs`** — `CommitUI::confirm_commit(rendered)` takes the already-formatted message, so the UI layer never reads `Config`. Offers Accept/Edit/Regenerate/Cancel. Color-coded diff preview. Clipboard support via `arboard` (used in the `log` command for changelog copy).
 
 ### stdout / stderr contract
 
@@ -105,7 +107,7 @@ ChangelogSummary { title, title_en, highlights, highlights_en, categories: Chang
 ChangelogCategories { features, fixes, improvements, others }  // All Vec<String> with bilingual items
 
 // src/cli.rs - Commands enum with clap derive
-Commands::Status | Commit { api_key, model, base_url, auto, show_diff, debug } | Diff { staged } | Log { count, grep, author, since, until, full, api_key, model, base_url, debug } | Init { local, force }
+Commands::Status | Commit { api_key, model, base_url, auto, dry_run, show_diff, debug } | Diff { staged } | Log { count, grep, author, since, until, full, export, api_key, model, base_url, debug } | Review { api_key, model, base_url, staged, unstaged, base, debug } | Config { action, show_secrets } | Hook { action } | Init { local, force }
 ```
 
 ## Configuration

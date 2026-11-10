@@ -77,58 +77,178 @@ where
     }
 }
 
-impl CommitMessage {
-    pub fn format_conventional(&self) -> String {
-        let mut message = String::new();
+/// Accepted values for `commit.format`. Anything else falls back to
+/// `conventional`; `config doctor` reports the typo instead of hiding it.
+pub const FORMATS: [&str; 3] = ["conventional", "plain", "english"];
 
-        // Header: type(scope): 中文描述
+/// Emoji per Conventional Commits type. Unknown types get nothing rather than
+/// a generic sparkle, which would be noise on every commit.
+fn emoji_for(commit_type: &str) -> Option<&'static str> {
+    match commit_type.trim().to_lowercase().as_str() {
+        "feat" => Some("✨"),
+        "fix" => Some("🐛"),
+        "docs" => Some("📝"),
+        "style" => Some("💄"),
+        "refactor" => Some("♻️"),
+        "perf" => Some("⚡️"),
+        "test" => Some("✅"),
+        "build" => Some("📦"),
+        "ci" => Some("👷"),
+        "chore" => Some("🔧"),
+        "revert" => Some("⏪"),
+        _ => None,
+    }
+}
+
+impl CommitMessage {
+    /// Render according to `commit.format` and `commit.include_emoji`.
+    ///
+    /// - `conventional` — `type(scope): 中文描述` + English line (default)
+    /// - `plain`        — no type prefix, still bilingual
+    /// - `english`      — keeps the type prefix, English line only
+    pub fn render(&self, format: &str, include_emoji: bool) -> String {
+        match format.trim().to_lowercase().as_str() {
+            "plain" => self.format_plain(include_emoji),
+            "english" => self.format_english(include_emoji),
+            _ => self.format_conventional(include_emoji),
+        }
+    }
+
+    /// English text, falling back to the Chinese one when the model omitted it.
+    fn english_or_fallback(&self) -> &str {
+        if self.description_en.trim().is_empty() {
+            &self.description
+        } else {
+            &self.description_en
+        }
+    }
+
+    fn push_header(&self, message: &mut String, include_emoji: bool, use_english: bool) {
+        if include_emoji {
+            if let Some(emoji) = emoji_for(&self.commit_type) {
+                message.push_str(emoji);
+                message.push(' ');
+            }
+        }
+
         message.push_str(&self.commit_type);
         if let Some(scope) = &self.scope {
             message.push_str(&format!("({})", scope));
         }
         message.push_str(": ");
+
+        if use_english {
+            message.push_str(self.english_or_fallback());
+        } else {
+            message.push_str(&self.description);
+        }
+    }
+
+    pub fn format_conventional(&self, include_emoji: bool) -> String {
+        let mut message = String::new();
+
+        // Header: type(scope): 中文描述
+        self.push_header(&mut message, include_emoji, false);
+        message.push('\n');
+        message.push_str(self.english_or_fallback());
+
+        self.push_body(&mut message, false);
+        self.push_breaking_change(&mut message);
+
+        message
+    }
+
+    /// No type prefix — for repositories that do not follow the spec.
+    pub fn format_plain(&self, include_emoji: bool) -> String {
+        let mut message = String::new();
+
+        if include_emoji {
+            if let Some(emoji) = emoji_for(&self.commit_type) {
+                message.push_str(emoji);
+                message.push(' ');
+            }
+        }
         message.push_str(&self.description);
         message.push('\n');
-        message.push_str(&self.description_en);
+        message.push_str(self.english_or_fallback());
 
-        // Body - 双语格式
-        if let (Some(body_zh), Some(body_en)) = (&self.body, &self.body_en) {
-            if !body_zh.is_empty() || !body_en.is_empty() {
-                message.push_str("\n\n");
+        self.push_body(&mut message, false);
+        self.push_breaking_change(&mut message);
 
-                // 使用较长的数组长度，确保所有内容都被包含
-                let max_len = body_zh.len().max(body_en.len());
+        message
+    }
 
-                for i in 0..max_len {
-                    if i > 0 {
-                        message.push('\n');
-                    }
+    /// English only, type prefix kept.
+    pub fn format_english(&self, include_emoji: bool) -> String {
+        let mut message = String::new();
 
-                    // 安全获取中文内容
-                    if let Some(zh) = body_zh.get(i) {
-                        message.push_str(zh);
-                        message.push('\n');
-                    }
+        self.push_header(&mut message, include_emoji, true);
 
-                    // 安全获取英文内容
-                    if let Some(en) = body_en.get(i) {
-                        message.push_str(en);
-                    } else if body_zh.get(i).is_some() {
-                        // 如果有中文但没有对应英文，添加占位符
-                        message.push_str("[Translation needed]");
-                    }
+        self.push_body(&mut message, true);
+        self.push_breaking_change(&mut message);
+
+        message
+    }
+
+    /// Bilingual body: each Chinese line is followed by its English counterpart.
+    /// `english_only` drops the Chinese lines.
+    fn push_body(&self, message: &mut String, english_only: bool) {
+        let Some(body_zh) = &self.body else {
+            if let Some(body_en) = &self.body_en {
+                if !body_en.is_empty() {
+                    message.push_str("\n\n");
+                    message.push_str(&body_en.join("\n"));
                 }
+            }
+            return;
+        };
+
+        let empty_en: Vec<String> = Vec::new();
+        let body_en = self.body_en.as_ref().unwrap_or(&empty_en);
+
+        if body_zh.is_empty() && body_en.is_empty() {
+            return;
+        }
+
+        message.push_str("\n\n");
+
+        let max_len = body_zh.len().max(body_en.len());
+
+        for i in 0..max_len {
+            if i > 0 {
+                message.push('\n');
+            }
+
+            if !english_only {
+                if let Some(zh) = body_zh.get(i) {
+                    message.push_str(zh);
+                    message.push('\n');
+                }
+            }
+
+            match body_en.get(i) {
+                Some(en) => message.push_str(en),
+                // A Chinese line without an English counterpart is flagged
+                // rather than silently dropped.
+                None if !english_only && body_zh.get(i).is_some() => {
+                    message.push_str("[Translation needed]")
+                }
+                None => {}
             }
         }
 
-        // Breaking change
+        // Trim the trailing newline left by the last Chinese-only line.
+        while message.ends_with('\n') {
+            message.pop();
+        }
+    }
+
+    fn push_breaking_change(&self, message: &mut String) {
         if let Some(breaking) = &self.breaking_change {
             message.push_str("\n\n");
             message.push_str("BREAKING CHANGE: ");
             message.push_str(breaking);
         }
-
-        message
     }
 }
 
@@ -541,4 +661,119 @@ Respond with a JSON object. Example:
         context.date_range.as_deref().unwrap_or("N/A"),
         commits_text
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(commit_type: &str) -> CommitMessage {
+        CommitMessage {
+            commit_type: commit_type.to_string(),
+            scope: Some("cli".to_string()),
+            description: "新增配置子命令".to_string(),
+            description_en: "Add config subcommand".to_string(),
+            body: None,
+            body_en: None,
+            breaking_change: None,
+        }
+    }
+
+    #[test]
+    fn conventional_puts_the_english_line_under_the_subject() {
+        let out = message("feat").render("conventional", false);
+        assert_eq!(out, "feat(cli): 新增配置子命令\nAdd config subcommand");
+    }
+
+    #[test]
+    fn plain_drops_the_type_prefix() {
+        let out = message("feat").render("plain", false);
+        assert!(!out.contains("feat"));
+        assert!(out.starts_with("新增配置子命令\n"));
+    }
+
+    #[test]
+    fn english_keeps_the_prefix_but_drops_chinese() {
+        let out = message("fix").render("english", false);
+        assert_eq!(out, "fix(cli): Add config subcommand");
+    }
+
+    #[test]
+    fn emoji_follows_the_commit_type() {
+        assert!(message("feat")
+            .render("conventional", true)
+            .starts_with("✨ feat(cli):"));
+        assert!(message("fix")
+            .render("conventional", true)
+            .starts_with("🐛 fix(cli):"));
+        // Unknown types get no emoji rather than a generic one.
+        assert!(message("wip")
+            .render("conventional", true)
+            .starts_with("wip(cli):"));
+        // A type that already carries its own prefix must not gain another.
+        assert!(!message("feat").render("conventional", false).contains('✨'));
+    }
+
+    #[test]
+    fn unknown_format_falls_back_to_conventional() {
+        let out = message("feat").render("coventional", false);
+        assert_eq!(out, message("feat").render("conventional", false));
+    }
+
+    #[test]
+    fn body_pairs_each_chinese_line_with_its_english_line() {
+        let mut msg = message("feat");
+        msg.body = Some(vec!["改了一处".to_string(), "改了另一处".to_string()]);
+        msg.body_en = Some(vec![
+            "Changed one".to_string(),
+            "Changed another".to_string(),
+        ]);
+
+        let out = msg.render("conventional", false);
+        assert_eq!(
+            out,
+            "feat(cli): 新增配置子命令\nAdd config subcommand\n\n改了一处\nChanged one\n改了另一处\nChanged another"
+        );
+    }
+
+    #[test]
+    fn missing_english_body_is_flagged_not_dropped() {
+        let mut msg = message("feat");
+        msg.body = Some(vec!["只有中文".to_string()]);
+
+        let out = msg.render("conventional", false);
+        assert!(out.contains("只有中文"));
+        assert!(out.contains("[Translation needed]"));
+    }
+
+    #[test]
+    fn english_format_keeps_only_the_english_body() {
+        let mut msg = message("feat");
+        msg.body = Some(vec!["改了一处".to_string()]);
+        msg.body_en = Some(vec!["Changed one".to_string()]);
+
+        let out = msg.render("english", false);
+        assert!(!out.contains("改了一处"));
+        assert!(out.contains("Changed one"));
+    }
+
+    #[test]
+    fn breaking_change_is_appended_in_every_format() {
+        for format in FORMATS {
+            let mut msg = message("feat");
+            msg.breaking_change = Some("api.model 改名为 ai.model".to_string());
+
+            let out = msg.render(format, false);
+            assert!(out.ends_with("BREAKING CHANGE: api.model 改名为 ai.model"));
+        }
+    }
+
+    #[test]
+    fn empty_english_description_falls_back_to_chinese() {
+        let mut msg = message("feat");
+        msg.description_en = String::new();
+
+        let out = msg.render("english", false);
+        assert_eq!(out, "feat(cli): 新增配置子命令");
+    }
 }

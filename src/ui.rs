@@ -1,4 +1,3 @@
-use crate::ai::CommitMessage;
 use anyhow::Result;
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
@@ -6,12 +5,13 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
 pub struct CommitUI;
 
 impl CommitUI {
-    pub fn confirm_commit(message: &CommitMessage) -> Result<CommitAction> {
+    /// `rendered` is the message already formatted per `commit.format`, so the
+    /// UI never needs to know how the config is shaped.
+    pub fn confirm_commit(rendered: &str) -> Result<CommitAction> {
         println!("\n{}", "Generated Commit Message:".bold().green());
         println!("{}", "─".repeat(50));
 
-        // Display formatted message
-        println!("{}", message.format_conventional().cyan());
+        println!("{}", rendered.cyan());
         println!("{}", "─".repeat(50));
 
         // Show options
@@ -31,7 +31,7 @@ impl CommitUI {
         match selection {
             0 => Ok(CommitAction::Accept),
             1 => {
-                let edited = Editor::new().edit(&message.format_conventional())?;
+                let edited = Editor::new().edit(rendered)?;
 
                 match edited {
                     Some(content) if !content.trim().is_empty() => Ok(CommitAction::Edit(content)),

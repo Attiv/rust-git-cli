@@ -12,7 +12,7 @@ use std::env;
 use std::process::Command;
 
 use crate::cli::{Args, Commands, ConfigAction, HookAction};
-use crate::config::Config;
+use crate::config::{mask_secret, Config};
 use crate::git::{GitRepo, LogOptions};
 use crate::ui::{CommitAction, CommitUI};
 
@@ -172,6 +172,7 @@ async fn handle_config_command(action: &Option<ConfigAction>, show_secrets: bool
 /// Every check that has caused "why is my config not working" at least once.
 async fn doctor(offline: bool) -> Result<()> {
     let mut problems = 0;
+    let mut warnings = 0;
 
     let ok = |label: &str, detail: String| {
         println!("  {} {:<24} {}", "✓".green(), label, detail);
@@ -234,38 +235,80 @@ async fn doctor(offline: bool) -> Result<()> {
     }
 
     // Credential resolution, mirroring Config::get_api_key
-    let key_source = if let Some(_k) = &config.ai.api_key {
-        Some(("config file (plain text)", true))
-    } else if let Some(name) = &config.ai.api_key_env {
-        match env::var(name) {
-            Ok(v) if !v.is_empty() => Some(("environment", false)),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let env_name = config.ai.api_key_env.as_deref();
+    // A pasted key in the name field used to fail as "not set in this shell",
+    // which points the reader at the wrong thing entirely.
+    let env_name_is_key = env_name.is_some_and(|n| !crate::config::is_env_var_name(n));
 
-    match key_source {
-        Some((where_, plaintext)) => {
-            ok("api key", format!("from {}", where_));
-            if plaintext {
-                problems += 1;
-                println!(
-                    "  {} {:<24} {}",
-                    "!".yellow(),
-                    "",
-                    "stored in the config file; prefer ai.api_key_env".yellow()
-                );
-            }
-        }
-        None => {
-            problems += 1;
-            let hint = match &config.ai.api_key_env {
-                Some(name) => format!("`{}` is not set in this shell", name),
-                None => "neither api_key nor api_key_env is configured".to_string(),
-            };
-            println!("  {} {:<24} {}", "✗".red(), "api key", hint);
-        }
+    let from_env = env_name
+        .filter(|_| !env_name_is_key)
+        .and_then(|n| env::var(n).ok())
+        .filter(|v| !v.is_empty());
+
+    if config.ai.api_key.is_some() {
+        ok("api key", "from config file (plain text)".to_string());
+        warnings += 1;
+        println!(
+            "  {} {:<24} {}",
+            "!".yellow(),
+            "",
+            "plain text in the config file; an env var is safer".yellow()
+        );
+    } else if from_env.is_some() {
+        ok(
+            "api key",
+            format!("from environment ({})", env_name.unwrap_or_default()),
+        );
+    } else if env_name_is_key {
+        problems += 1;
+        println!(
+            "  {} {:<24} ai.api_key_env holds `{}` — that is the key, not a variable name",
+            "✗".red(),
+            "api key",
+            mask_secret(env_name.unwrap_or_default())
+        );
+        println!(
+            "    {} {}",
+            "fix:".dimmed(),
+            "vgit config set ai.api_key <key>".dimmed()
+        );
+        println!(
+            "    {} {}",
+            "or:".dimmed(),
+            "export OPENAI_API_KEY=… then vgit config set ai.api_key_env OPENAI_API_KEY".dimmed()
+        );
+    } else {
+        problems += 1;
+        let hint = match env_name {
+            Some(name) => format!("`{}` is not set in this shell", name),
+            None => "neither api_key nor api_key_env is configured".to_string(),
+        };
+        println!("  {} {:<24} {}", "✗".red(), "api key", hint);
+    }
+
+    let format = config.commit.format.trim().to_lowercase();
+    if crate::ai::FORMATS.contains(&format.as_str()) {
+        ok(
+            "commit format",
+            format!(
+                "{}{}",
+                format,
+                if config.commit.include_emoji {
+                    ", with emoji"
+                } else {
+                    ""
+                }
+            ),
+        );
+    } else {
+        problems += 1;
+        println!(
+            "  {} {:<24} `{}` is unknown (valid: {})",
+            "✗".red(),
+            "commit format",
+            config.commit.format,
+            crate::ai::FORMATS.join(", ")
+        );
     }
 
     let diff_limit = config.commit.max_diff_size;
@@ -311,12 +354,12 @@ async fn doctor(offline: bool) -> Result<()> {
 
     if offline {
         println!("{}", "Skipped the network probe (--offline).".dimmed());
-        return report_doctor(problems);
+        return report_doctor(problems, warnings);
     }
 
     let Some(key) = config.get_api_key() else {
         println!("{}", "Skipped the network probe: no API key.".dimmed());
-        return report_doctor(problems);
+        return report_doctor(problems, warnings);
     };
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
@@ -355,17 +398,30 @@ async fn doctor(offline: bool) -> Result<()> {
     }
 
     println!();
-    report_doctor(problems)
+    report_doctor(problems, warnings)
 }
 
-fn report_doctor(problems: usize) -> Result<()> {
-    if problems == 0 {
+/// Problems block usage; warnings are advice. Keeping them apart stops a
+/// perfectly working setup from reporting "1 problem to fix".
+fn report_doctor(problems: usize, warnings: usize) -> Result<()> {
+    if problems == 0 && warnings == 0 {
         println!("{}", "No problems found.".green().bold());
+    } else if problems == 0 {
+        println!(
+            "{} {} warning(s), nothing blocking.",
+            "!".yellow().bold(),
+            warnings
+        );
     } else {
         println!(
-            "{} {} problem(s) to fix. Run `vgit config edit`.",
+            "{} {} problem(s) to fix{}. Run `vgit config edit`.",
             "!".yellow().bold(),
-            problems
+            problems,
+            if warnings > 0 {
+                format!(" (plus {} warning(s))", warnings)
+            } else {
+                String::new()
+            }
         );
     }
     Ok(())
@@ -446,10 +502,19 @@ fn show_config(show_secrets: bool) -> Result<()> {
     row(
         "ai.api_key_env",
         match &config.ai.api_key_env {
+            Some(name) if !crate::config::is_env_var_name(name) => format!(
+                "{} {}",
+                mask_secret(name),
+                "not a variable name — looks like the key itself".red()
+            ),
             Some(name) => {
                 let present = env::var(name).map(|v| !v.is_empty()).unwrap_or(false);
                 let state = if present {
                     "set".green().to_string()
+                } else if config.ai.api_key.is_some() {
+                    // Harmless: api_key takes precedence, so the env var's
+                    // absence says nothing about whether the setup works.
+                    "unused, ai.api_key wins".dimmed().to_string()
                 } else {
                     "missing in env".red().to_string()
                 };
@@ -486,18 +551,31 @@ fn show_config(show_secrets: bool) -> Result<()> {
 
     println!();
 
-    if config.ai.api_key.is_some() && !show_secrets {
+    if !crate::ai::FORMATS.contains(&config.commit.format.trim().to_lowercase().as_str()) {
         println!(
-            "{}",
-            "The API key is stored in plain text. Prefer ai.api_key_env.".yellow()
+            "{} {}",
+            "!".yellow().bold(),
+            format!(
+                "commit.format `{}` is unknown; falling back to conventional (valid: {}).",
+                config.commit.format,
+                crate::ai::FORMATS.join(", ")
+            )
+            .yellow()
         );
     }
 
-    println!(
-        "{}",
-        "Not honoured by this build: commit.format, commit.include_emoji, commit.auto_stage"
-            .dimmed()
-    );
+    if config.ai.api_key.is_some() && !show_secrets {
+        println!(
+            "{}",
+            "The API key is stored in plain text (file mode 600). To move it out:".yellow()
+        );
+        println!(
+            "{}",
+            "  export OPENAI_API_KEY=...   then   vgit config set ai.api_key_env OPENAI_API_KEY"
+                .dimmed()
+        );
+    }
+
     println!(
         "{}",
         "Edit with `config edit`, locate with `config path`.".dimmed()
@@ -580,10 +658,20 @@ fn open_config() -> Result<()> {
 }
 
 fn set_config(key: &str, value: &str) -> Result<()> {
+    // Catch the mistakes that would otherwise silently resolve to nothing.
+    Config::validate_set(key, value)?;
+
     let path = ensure_config_file()?;
     Config::set_key_value(&path, key, value)?;
 
-    println!("{} {} = {}", "✓".green().bold(), key, value.cyan());
+    // Never echo a secret back into a terminal log or a shared screen.
+    let shown = if key.contains("api_key") && !key.ends_with("api_key_env") {
+        mask_secret(value)
+    } else {
+        value.to_string()
+    };
+
+    println!("{} {} = {}", "✓".green().bold(), key, shown.cyan());
     println!("{}", format!("  written to {}", path.display()).dimmed());
 
     if let Err(e) = Config::load_with_source() {
@@ -744,18 +832,6 @@ fn write_export(
     );
 
     Ok(())
-}
-
-fn mask_secret(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-
-    if chars.len() <= 8 {
-        return "*".repeat(chars.len().max(1));
-    }
-
-    let head: String = chars[..4].iter().collect();
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{}…{}", head, tail)
 }
 
 fn handle_status_command(
@@ -1317,7 +1393,7 @@ async fn handle_commit_command(
         .await?;
 
     // Handle user action
-    let formatted = commit_message.format_conventional();
+    let formatted = commit_message.render(&config.commit.format, config.commit.include_emoji);
 
     if dry_run {
         // Interactive callers get a header; the commit hook pipes stdout and
@@ -1339,7 +1415,7 @@ async fn handle_commit_command(
     let action = if auto {
         CommitAction::Accept
     } else {
-        CommitUI::confirm_commit(&commit_message)?
+        CommitUI::confirm_commit(&formatted)?
     };
 
     match action {
