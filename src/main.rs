@@ -18,12 +18,11 @@ use crate::ui::{CommitAction, CommitUI};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logger - RUST_LOG env var takes priority, otherwise use config
-    let config = Config::load_or_warn();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&config.log_level))
-        .init();
-
+    // Parse arguments before touching the logger: `--debug` is what decides
+    // whether the `debug!` calls scattered through the AI clients are shown.
     let args = Args::parse();
+    init_logging(args.debug());
+
     let path = args
         .path
         .clone()
@@ -128,6 +127,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Routing for the `debug!` calls in the AI clients.
+///
+/// `RUST_LOG` still wins, so anyone with that habit configured keeps working.
+/// Otherwise `--debug` is the only switch: the previous `log_level` config key
+/// could not be set correctly through `config set` (it is a top-level key, but
+/// `set` writes into the current section) and defaulted to `warn`, which
+/// silently swallowed every `--debug` line.
+fn init_logging(debug: bool) {
+    let mut builder = env_logger::Builder::new();
+
+    match env::var("RUST_LOG") {
+        Ok(spec) if !spec.trim().is_empty() => {
+            builder.parse_filters(&spec);
+        }
+        _ => {
+            builder.filter_level(if debug {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Warn
+            });
+        }
+    }
+
+    builder.format_timestamp(None).init();
 }
 
 fn handle_init_command(local: bool, force: bool) -> Result<()> {
@@ -547,7 +572,6 @@ fn show_config(show_secrets: bool) -> Result<()> {
         config.commit.max_diff_size.to_string(),
     );
     row("commit.auto_stage", config.commit.auto_stage.to_string());
-    row("log_level", config.log_level.clone());
 
     println!();
 

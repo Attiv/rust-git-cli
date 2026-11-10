@@ -14,6 +14,21 @@ pub struct Args {
     pub verbose: bool,
 }
 
+impl Args {
+    /// Whether the selected command was given `--debug`.
+    ///
+    /// The flag lives on the subcommands that actually call the AI, so the
+    /// logger has to ask the parsed arguments instead of guessing.
+    pub fn debug(&self) -> bool {
+        match &self.command {
+            Some(Commands::Commit { debug, .. })
+            | Some(Commands::Review { debug, .. })
+            | Some(Commands::Log { debug, .. }) => *debug,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Check repository status (default)

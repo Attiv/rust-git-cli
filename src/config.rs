@@ -8,16 +8,30 @@ use std::sync::Once;
 static WARN_ONCE: Once = Once::new();
 static WARN_ENV_ONCE: Once = Once::new();
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Config {
-    pub ai: AIConfig,
-    pub commit: CommitConfig,
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
-}
+/// Every key `config set` may write.
+///
+/// Explicit on purpose: `set` edits the file line by line, so a typo would
+/// otherwise land in whatever section happened to be current and then be
+/// ignored by serde — the exact failure that made `log_level` unfixable.
+pub const KNOWN_KEYS: &[&str] = &[
+    "ai.provider",
+    "ai.model",
+    "ai.api_key",
+    "ai.api_key_env",
+    "ai.base_url",
+    "ai.max_tokens",
+    "commit.format",
+    "commit.include_emoji",
+    "commit.max_diff_size",
+    "commit.auto_stage",
+];
 
-fn default_log_level() -> String {
-    "warn".to_string()
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub ai: AIConfig,
+    #[serde(default)]
+    pub commit: CommitConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -37,30 +51,44 @@ fn default_max_tokens() -> u32 {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommitConfig {
+    #[serde(default = "default_format")]
     pub format: String,
+    #[serde(default)]
     pub include_emoji: bool,
+    #[serde(default = "default_max_diff_size")]
     pub max_diff_size: usize,
+    #[serde(default)]
     pub auto_stage: bool,
 }
 
-impl Default for Config {
+fn default_format() -> String {
+    "conventional".to_string()
+}
+
+fn default_max_diff_size() -> usize {
+    4000
+}
+
+impl Default for AIConfig {
     fn default() -> Self {
         Self {
-            ai: AIConfig {
-                provider: "openai".to_string(),
-                model: "gpt-4.1".to_string(),
-                api_key_env: None,
-                api_key: None,
-                base_url: None,
-                max_tokens: 2000,
-            },
-            commit: CommitConfig {
-                format: "conventional".to_string(),
-                include_emoji: false,
-                max_diff_size: 4000,
-                auto_stage: false,
-            },
-            log_level: default_log_level(),
+            provider: "openai".to_string(),
+            model: "gpt-4.1".to_string(),
+            api_key_env: None,
+            api_key: None,
+            base_url: None,
+            max_tokens: default_max_tokens(),
+        }
+    }
+}
+
+impl Default for CommitConfig {
+    fn default() -> Self {
+        Self {
+            format: default_format(),
+            include_emoji: false,
+            max_diff_size: default_max_diff_size(),
+            auto_stage: false,
         }
     }
 }
@@ -197,7 +225,19 @@ impl Config {
                     );
                 }
             }
-            _ => {}
+            _ => {
+                if !KNOWN_KEYS.contains(&key) {
+                    anyhow::bail!(
+                        "`{}` is not a known setting.\n\
+                         \n\
+                         Known settings:\n  {}\n\
+                         \n\
+                         Run `vgit config edit` to add anything else by hand.",
+                        key.trim(),
+                        KNOWN_KEYS.join("\n  ")
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -583,6 +623,56 @@ auto_stage = false
         assert!(Config::validate_set("ai.provider", "Anthropic").is_ok());
         assert!(Config::validate_set("commit.format", "plain").is_ok());
         assert!(Config::validate_set("commit.auto_stage", "true").is_ok());
+    }
+
+    #[test]
+    fn every_known_key_is_accepted() {
+        // Guards against the list and the validators drifting apart: a key may
+        // still be rejected for a bad value, but never as "unknown".
+        for key in KNOWN_KEYS {
+            if let Err(e) = Config::validate_set(key, "x") {
+                assert!(
+                    !e.to_string().contains("not a known setting"),
+                    "{} is listed in KNOWN_KEYS but validate_set calls it unknown",
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_set_rejects_unknown_keys() {
+        // `log_level` used to be a real field, but `set` wrote it into the
+        // wrong section, so it never took effect. It must not be accepted now.
+        let err = Config::validate_set("log_level", "debug")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a known setting"));
+        assert!(err.contains("commit.max_diff_size"));
+
+        // A typo must fail instead of being written into the current section.
+        let err = Config::validate_set("commit.maxdiffsize", "5000")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a known setting"));
+    }
+
+    #[test]
+    fn a_config_that_still_contains_log_level_parses() {
+        // Files written by older versions must not start failing to load.
+        let toml = r#"
+log_level = "debug"
+
+[ai]
+provider = "openai"
+model = "gpt-4.1"
+
+[commit]
+format = "plain"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ai.model, "gpt-4.1");
+        assert_eq!(config.commit.format, "plain");
     }
 
     #[test]

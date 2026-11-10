@@ -156,4 +156,12 @@ GitHub Actions via `.github/workflows/rust.yml`:
 
 ```bash
 cargo run -- commit --debug   # Shows raw AI response and JSON parsing
+RUST_LOG=debug cargo run -- review   # Same output, for any command
 ```
+
+`--debug` is the only switch: `main` parses the arguments first, then sets the
+`env_logger` filter to `debug` for that run (otherwise `warn`). `RUST_LOG` still
+overrides it. There is no `log_level` config key — it could never be set
+correctly, because it is a top-level key while `config set` writes into the
+current section, and its default of `warn` swallowed every `--debug` line.
+Log output goes to stderr so stdout stays usable as data (the commit hook pipes it).
