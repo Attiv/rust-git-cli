@@ -138,6 +138,13 @@ pub enum AIClient {
 }
 
 impl AIClient {
+    pub async fn ping(&self) -> Result<String> {
+        match self {
+            AIClient::OpenAI(client) => client.ping().await,
+            AIClient::Anthropic(client) => client.ping().await,
+        }
+    }
+
     pub async fn generate_commit_message(
         &self,
         diff: &str,
@@ -185,19 +192,28 @@ pub fn create_client(
     model: String,
     base_url: Option<String>,
     max_tokens: u32,
+    max_diff_size: usize,
 ) -> Result<AIClient> {
     match provider.to_lowercase().as_str() {
         "openai" => Ok(AIClient::OpenAI(openai::OpenAIClient::new(
-            api_key, model, base_url, max_tokens,
+            api_key,
+            model,
+            base_url,
+            max_tokens,
+            max_diff_size,
         ))),
         "anthropic" => Ok(AIClient::Anthropic(anthropic::AnthropicClient::new(
-            api_key, model, base_url, max_tokens,
+            api_key,
+            model,
+            base_url,
+            max_tokens,
+            max_diff_size,
         ))),
         _ => anyhow::bail!("Unsupported AI provider: {}", provider),
     }
 }
 
-pub fn build_prompt(diff: &str, context: &CommitContext) -> String {
+pub fn build_prompt(diff: &str, context: &CommitContext, max_chars: usize) -> String {
     format!(
         r#"You are a Git commit message generator. Based on the following git diff, generate a bilingual (Chinese and English) structured commit message.
 
@@ -242,7 +258,7 @@ Respond with a JSON object containing these fields. Example:
         context.file_count,
         context.added_lines,
         context.removed_lines,
-        truncate_diff(diff, 3000)
+        truncate_diff(diff, max_chars)
     )
 }
 
@@ -311,7 +327,7 @@ fn format_bilingual_section(output: &mut String, title: &str, zh: &[String], en:
     output.push('\n');
 }
 
-pub fn build_review_prompt(diff: &str, context: &ReviewContext) -> String {
+pub fn build_review_prompt(diff: &str, context: &ReviewContext, max_chars: usize) -> String {
     format!(
         r#"You are a senior software engineer doing a code review. Based on the following git diff, generate a bilingual (Chinese and English) review report.
 
@@ -360,7 +376,7 @@ JSON schema:
         context.file_count,
         context.added_lines,
         context.removed_lines,
-        truncate_diff(diff, 6000)
+        truncate_diff(diff, max_chars)
     )
 }
 

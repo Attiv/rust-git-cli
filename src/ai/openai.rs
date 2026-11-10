@@ -67,6 +67,7 @@ pub struct OpenAIClient {
     base_url: String,
     client: reqwest::Client,
     initial_max_tokens: u32,
+    max_diff_size: usize,
 }
 
 impl OpenAIClient {
@@ -75,6 +76,7 @@ impl OpenAIClient {
         model: String,
         base_url: Option<String>,
         initial_max_tokens: u32,
+        max_diff_size: usize,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -88,7 +90,45 @@ impl OpenAIClient {
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             client,
             initial_max_tokens,
+            max_diff_size,
         }
+    }
+
+    /// Cheap reachability and credential check. Lists models instead of
+    /// generating anything, so it costs nothing and cannot be rate limited
+    /// by token spend.
+    pub async fn ping(&self) -> Result<String> {
+        let url = format!("{}/models", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .with_context(|| format!("Cannot reach {}", url))?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let models = body.matches("\"id\"").count();
+            return Ok(if models > 0 {
+                format!("{} models listed", models)
+            } else {
+                "endpoint reachable".to_string()
+            });
+        }
+
+        let reason = match status.as_u16() {
+            401 => "authentication failed, the key was rejected",
+            403 => "key accepted but lacks permission",
+            404 => "endpoint not found, check ai.base_url",
+            429 => "rate limited, but the key is valid",
+            _ => "request rejected",
+        };
+
+        anyhow::bail!("{} (HTTP {})", reason, status)
     }
 
     pub async fn generate_commit_message(
@@ -97,7 +137,7 @@ impl OpenAIClient {
         context: &CommitContext,
         debug: bool,
     ) -> Result<CommitMessage> {
-        let prompt = build_prompt(diff, context);
+        let prompt = build_prompt(diff, context, self.max_diff_size);
 
         let mut max_tokens = self.initial_max_tokens;
         let max_attempts = 4;
@@ -206,7 +246,8 @@ impl OpenAIClient {
                     }
 
                     if attempt + 1 < max_attempts {
-                        max_tokens = (max_tokens.saturating_mul(2)).min(4000);
+                        max_tokens = (max_tokens.saturating_mul(2))
+                            .min(self.initial_max_tokens.saturating_mul(2));
                         debug!(
                             "finish_reason=length, retrying with max_tokens={}",
                             max_tokens
@@ -301,7 +342,7 @@ impl OpenAIClient {
         context: &ReviewContext,
         debug: bool,
     ) -> Result<ReviewReport> {
-        let prompt = build_review_prompt(diff, context);
+        let prompt = build_review_prompt(diff, context, self.max_diff_size.saturating_mul(2));
 
         let mut max_tokens = self.initial_max_tokens;
         let max_attempts = 4;
@@ -402,7 +443,8 @@ impl OpenAIClient {
             match finish_reason.as_deref() {
                 Some("length") => {
                     if attempt + 1 < max_attempts {
-                        max_tokens = (max_tokens.saturating_mul(2)).min(4000);
+                        max_tokens = (max_tokens.saturating_mul(2))
+                            .min(self.initial_max_tokens.saturating_mul(2));
                         debug!(
                             "finish_reason=length, retrying with max_tokens={}",
                             max_tokens

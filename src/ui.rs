@@ -100,8 +100,10 @@ impl CommitUI {
         println!("{} {}", "✓".green().bold(), message.green());
     }
 
+    /// Progress chatter goes to stderr so stdout stays usable as data,
+    /// which is what the commit hook relies on.
     pub fn show_info(message: &str) {
-        println!("{} {}", "ℹ".blue(), message);
+        eprintln!("{} {}", "ℹ".blue(), message);
     }
 }
 

@@ -3,8 +3,7 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo
-Cargo.lock
+# Cargo.lock is tracked: this is a binary crate, reproducible builds need it.
 
 # IDE
 .idea/

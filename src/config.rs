@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
+
+static WARN_ONCE: Once = Once::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -52,7 +56,7 @@ impl Default for Config {
             commit: CommitConfig {
                 format: "conventional".to_string(),
                 include_emoji: false,
-                max_diff_size: 10000,
+                max_diff_size: 4000,
                 auto_stage: false,
             },
             log_level: default_log_level(),
@@ -61,28 +65,63 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        // Try to load from multiple locations
-        let mut config_paths = vec![PathBuf::from(".rust-git-cli.toml")];
+    /// Config file locations in lookup order. The first one that exists wins.
+    pub fn candidate_paths() -> Vec<PathBuf> {
+        let mut paths = vec![PathBuf::from(".rust-git-cli.toml")];
 
-        // Only add home directory paths if home_dir is available
         if let Some(home) = dirs::home_dir() {
-            config_paths.push(home.join(".config/rust-git-cli/config.toml"));
-            config_paths.push(home.join(".rust-git-cli.toml"));
+            paths.push(home.join(".config/rust-git-cli/config.toml"));
+            paths.push(home.join(".rust-git-cli.toml"));
         }
 
-        for path in config_paths {
-            if path.exists() && path.is_file() {
-                let content = fs::read_to_string(&path)
-                    .context(format!("Failed to read config from {:?}", path))?;
-                let config: Config = toml::from_str(&content)
-                    .context(format!("Failed to parse config from {:?}", path))?;
-                return Ok(config);
+        paths
+    }
+
+    /// Where `init` writes by default when `--local` is not used.
+    pub fn default_path() -> Result<PathBuf> {
+        dirs::home_dir()
+            .map(|p| p.join(".config/rust-git-cli/config.toml"))
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+    }
+
+    /// The file actually being read, if any.
+    pub fn resolve_path() -> Option<PathBuf> {
+        Self::candidate_paths()
+            .into_iter()
+            .find(|p| p.exists() && p.is_file())
+    }
+
+    /// Best-effort load for command paths that must keep working even with a
+    /// broken config. A parse failure is reported once instead of being
+    /// swallowed silently, so "my settings have no effect" stops being a
+    /// mystery.
+    pub fn load_or_warn() -> Self {
+        match Self::load_with_source() {
+            Ok((config, _)) => config,
+            Err(e) => {
+                WARN_ONCE.call_once(|| {
+                    eprintln!("{} {}", "warning:".yellow().bold(), e);
+                    eprintln!(
+                        "{}",
+                        "Falling back to built-in defaults. Run `config path` to find the file, `config edit` to fix it."
+                            .dimmed()
+                    );
+                });
+                Self::default()
             }
         }
+    }
 
-        // Return default if no config file found
-        Ok(Self::default())
+    pub fn load_with_source() -> Result<(Self, Option<PathBuf>)> {
+        if let Some(path) = Self::resolve_path() {
+            let content = fs::read_to_string(&path)
+                .context(format!("Failed to read config from {}", path.display()))?;
+            let config: Config = toml::from_str(&content)
+                .context(format!("Failed to parse config from {}", path.display()))?;
+            return Ok((config, Some(path)));
+        }
+
+        Ok((Self::default(), None))
     }
 
     pub fn get_api_key(&self) -> Option<String> {
@@ -103,10 +142,7 @@ impl Config {
         let path = if local {
             PathBuf::from(".rust-git-cli.toml")
         } else {
-            // Use ~/.config/rust-git-cli/config.toml
-            dirs::home_dir()
-                .map(|p| p.join(".config/rust-git-cli/config.toml"))
-                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            Self::default_path()?
         };
 
         // Check if file already exists
@@ -191,5 +227,229 @@ auto_stage = false
         }
 
         Ok(path)
+    }
+
+    /// Rewrite a single key in place, keeping comments and layout intact.
+    /// Only the value after `=` on the matching line is replaced.
+    pub fn set_key_value(path: &Path, key: &str, raw_value: &str) -> Result<()> {
+        let (section, field) = match key.split_once('.') {
+            Some((s, f)) => (Some(s.to_string()), f.to_string()),
+            None => (None, key.to_string()),
+        };
+
+        let formatted = format_value(raw_value);
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+        // Locate the matching assignment within the right section.
+        let mut current: Option<String> = None;
+        let mut target: Option<usize> = None;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            if let Some(name) = section_name(trimmed) {
+                current = Some(name);
+                continue;
+            }
+
+            if trimmed.starts_with('#') {
+                continue;
+            }
+
+            if let Some((k, _)) = trimmed.split_once('=') {
+                let same_section = match (&current, &section) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    (None, None) => true,
+                    _ => false,
+                };
+
+                if same_section && k.trim() == field {
+                    target = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        match target {
+            Some(idx) => {
+                let line = lines[idx].clone();
+                if let Some(eq) = line.find('=') {
+                    lines[idx] = format!("{} = {}", line[..eq].trim_end(), formatted);
+                }
+            }
+            None => {
+                let new_line = format!("{} = {}", field, formatted);
+                match find_section(&lines, section.as_deref()) {
+                    Some((_, end)) => {
+                        // Insert after the last meaningful line of the section.
+                        let mut insert_at = end;
+                        while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
+                            insert_at -= 1;
+                        }
+                        lines.insert(insert_at, new_line);
+                    }
+                    None => {
+                        if let Some(name) = &section {
+                            lines.push(String::new());
+                            lines.push(format!("[{}]", name));
+                        }
+                        lines.push(new_line);
+                    }
+                }
+            }
+        }
+
+        let mut out = lines.join("\n");
+        out.push('\n');
+        fs::write(path, out).with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// `[ai]` -> Some("ai"), anything else -> None.
+fn section_name(trimmed: &str) -> Option<String> {
+    if trimmed.starts_with('[') && !trimmed.starts_with("[[") && trimmed.ends_with(']') {
+        Some(
+            trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Byte range of a section body: (header line, exclusive end).
+fn find_section(lines: &[String], name: Option<&str>) -> Option<(usize, usize)> {
+    let name = name?;
+
+    let start = lines
+        .iter()
+        .position(|l| section_name(l.trim()).is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
+
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, l)| section_name(l.trim()).is_some())
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+
+    Some((start, end))
+}
+
+/// Numbers and booleans go in bare; everything else gets quoted.
+fn format_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
+        return trimmed.to_lowercase();
+    }
+
+    if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
+        return trimmed.to_string();
+    }
+
+    let already_quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''));
+
+    if already_quoted {
+        return trimmed.to_string();
+    }
+
+    let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const BASE: &str = r#"# top of file
+[ai]
+# which model to talk to
+provider = "openai"
+model = "gpt-4"
+
+[commit]
+format = "conventional"
+include_emoji = false
+max_diff_size = 4000
+auto_stage = false
+"#;
+
+    fn temp_config(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rgc-test-{}-{}", std::process::id(), name));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn format_value_leaves_scalars_bare() {
+        assert_eq!(format_value("true"), "true");
+        assert_eq!(format_value("FALSE"), "false");
+        assert_eq!(format_value("4000"), "4000");
+        assert_eq!(format_value("1.5"), "1.5");
+    }
+
+    #[test]
+    fn format_value_quotes_strings() {
+        assert_eq!(format_value("gpt-4"), "\"gpt-4\"");
+        assert_eq!(format_value("\"already\""), "\"already\"");
+        assert_eq!(format_value("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn set_replaces_value_and_keeps_comments() {
+        let path = temp_config("replace", BASE);
+
+        Config::set_key_value(&path, "ai.model", "deepseek-chat").unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# top of file"));
+        assert!(out.contains("# which model to talk to"));
+        assert!(out.contains("model = \"deepseek-chat\""));
+        assert!(out.contains("max_diff_size = 4000"));
+
+        let parsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.ai.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn set_inserts_missing_key_into_existing_section() {
+        let path = temp_config("insert", BASE);
+
+        Config::set_key_value(&path, "ai.max_tokens", "8000").unwrap();
+
+        let parsed: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.ai.max_tokens, 8000);
+        assert_eq!(parsed.ai.model, "gpt-4");
+        assert_eq!(parsed.commit.max_diff_size, 4000);
+    }
+
+    #[test]
+    fn set_creates_missing_section() {
+        let path = temp_config("newsec", "[ai]\nprovider = \"openai\"\nmodel = \"gpt-4\"\n");
+
+        Config::set_key_value(&path, "logging.level", "debug").unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(out.contains("[logging]"));
+        assert!(out.contains("level = \"debug\""));
+    }
+
+    #[test]
+    fn section_name_only_matches_tables() {
+        assert_eq!(section_name("[ai]"), Some("ai".to_string()));
+        assert_eq!(section_name("[[bin]]"), None);
+        assert_eq!(section_name("key = 1"), None);
     }
 }

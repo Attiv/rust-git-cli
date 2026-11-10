@@ -13,6 +13,7 @@ pub struct AnthropicClient {
     base_url: String,
     client: reqwest::Client,
     initial_max_tokens: u32,
+    max_diff_size: usize,
 }
 
 impl AnthropicClient {
@@ -21,6 +22,7 @@ impl AnthropicClient {
         model: String,
         base_url: Option<String>,
         initial_max_tokens: u32,
+        max_diff_size: usize,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -34,7 +36,47 @@ impl AnthropicClient {
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             client,
             initial_max_tokens,
+            max_diff_size,
         }
+    }
+
+    /// One-token round trip. Anthropic has no useful model list, so this is the
+    /// smallest request that still proves the key is accepted.
+    pub async fn ping(&self) -> Result<String> {
+        let url = format!("{}/v1/messages", self.base_url);
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Cannot reach {}", url))?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            return Ok("one-token reply received".to_string());
+        }
+
+        let reason = match status.as_u16() {
+            401 => "authentication failed, the key was rejected",
+            403 => "key accepted but lacks permission",
+            404 => "endpoint not found, check ai.base_url",
+            429 => "rate limited, but the key is valid",
+            _ => "request rejected",
+        };
+
+        anyhow::bail!("{} (HTTP {})", reason, status)
     }
 
     pub async fn generate_commit_message(
@@ -43,7 +85,7 @@ impl AnthropicClient {
         context: &CommitContext,
         debug: bool,
     ) -> Result<CommitMessage> {
-        let prompt = build_prompt(diff, context);
+        let prompt = build_prompt(diff, context, self.max_diff_size);
 
         let request = AnthropicRequest {
             model: self.model.clone(),
@@ -176,7 +218,7 @@ impl AnthropicClient {
         context: &ReviewContext,
         debug: bool,
     ) -> Result<ReviewReport> {
-        let prompt = build_review_prompt(diff, context);
+        let prompt = build_review_prompt(diff, context, self.max_diff_size.saturating_mul(2));
 
         let request = AnthropicRequest {
             model: self.model.clone(),

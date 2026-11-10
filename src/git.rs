@@ -11,6 +11,11 @@ impl GitRepo {
         Ok(Self { repo })
     }
 
+    /// The `.git` directory (or the gitdir of a worktree).
+    pub fn git_dir(&self) -> &std::path::Path {
+        self.repo.path()
+    }
+
     pub fn get_status(&self) -> Result<GitStatus> {
         let mut status_opts = StatusOptions::new();
         status_opts.include_untracked(true);
@@ -151,6 +156,44 @@ impl GitRepo {
         })?;
 
         Ok(diff_text)
+    }
+
+    /// Everything that differs from `base` through the working tree — committed
+    /// on this branch, staged, and uncommitted. This is what a pull request
+    /// would show, which is not the same as `get_combined_diff`.
+    pub fn get_diff_against_base(&self, base: &str) -> Result<(String, usize)> {
+        let base_tree = self
+            .repo
+            .revparse_single(base)
+            .with_context(|| format!("Cannot resolve base ref `{}`", base))?
+            .peel_to_tree()
+            .with_context(|| format!("`{}` does not point to a commit", base))?;
+
+        let mut diff_opts = DiffOptions::new();
+        diff_opts.include_untracked(true);
+
+        let diff = self
+            .repo
+            .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut diff_opts))
+            .with_context(|| format!("Failed to diff working tree against `{}`", base))?;
+
+        let file_count = diff.deltas().len();
+        let mut diff_text = String::new();
+
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            use git2::DiffLineType::*;
+            let prefix = match line.origin_value() {
+                Addition => "+",
+                Deletion => "-",
+                Context => " ",
+                _ => "",
+            };
+            let content = std::str::from_utf8(line.content()).unwrap_or("");
+            diff_text.push_str(&format!("{}{}", prefix, content));
+            true
+        })?;
+
+        Ok((diff_text, file_count))
     }
 
     pub fn get_combined_diff(&self) -> Result<String> {
