@@ -25,7 +25,7 @@ impl AnthropicClient {
         max_diff_size: usize,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(super::http_timeout())
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");

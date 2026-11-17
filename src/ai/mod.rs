@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::time::Duration;
 
 pub mod anthropic;
 pub mod openai;
@@ -776,4 +777,16 @@ mod tests {
         let out = msg.render("english", false);
         assert_eq!(out, "feat(cli): 新增配置子命令");
     }
+}
+
+/// Request timeout for AI calls. Slow local proxies and thinking models can
+/// take minutes, so the default is generous and can be overridden with
+/// `VGIT_TIMEOUT_SECS` (e.g. `export VGIT_TIMEOUT_SECS=600`).
+pub fn http_timeout() -> Duration {
+    let secs = std::env::var("VGIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(300);
+    Duration::from_secs(secs)
 }
